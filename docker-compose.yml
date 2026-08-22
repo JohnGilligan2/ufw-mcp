@@ -1,0 +1,73 @@
+# ufw-mcp - Portainer stack.
+#
+# EVERY variable the code reads must appear below. Portainer only SUBSTITUTES
+# stack variables into this file; it does not inject them, so a missing entry
+# is a silent fallback to the default.
+#
+# SECRETS TRAVEL AS BASE64. Portainer substitutes into compose and Compose then
+# expands the result, so a `$` inside a plaintext secret is silently deleted and
+# the symptom is an auth failure with no error anywhere.
+services:
+  ufw-mcp:
+    build: .
+    image: ufw-mcp:latest
+    container_name: ufw-mcp
+    restart: unless-stopped
+    # The docker host has exhausted its default address pools, so joining the
+    # pre-existing bridge is the only way a new stack creates. Safe here: one
+    # service, reached on its published port, talking outbound by IP.
+    network_mode: bridge
+    ports:
+      - "${MCP_HOST_PORT:-8121}:8000"
+    environment:
+      MCP_TRANSPORT: http
+      MCP_BIND_HOST: 0.0.0.0
+      MCP_PORT: 8000
+      MCP_PATH: /mcp
+      # --- Entra (resource-server mode; NO client secret here) ---
+      MCP_AUTH_ENABLED: "${MCP_AUTH_ENABLED:-true}"
+      MCP_BASE_URL: "${MCP_BASE_URL}"
+      ENTRA_TENANT_ID: "${ENTRA_TENANT_ID}"
+      ENTRA_CLIENT_ID: "${ENTRA_CLIENT_ID}"
+      ENTRA_IDENTIFIER_URI: "${ENTRA_IDENTIFIER_URI}"
+      ENTRA_SCOPE_NAME: "${ENTRA_SCOPE_NAME:-access_as_user}"
+      ENTRA_REQUIRED_SCOPES: "${ENTRA_REQUIRED_SCOPES:-access_as_user}"
+      ENTRA_ADVERTISE_OFFLINE_ACCESS: "true"
+      # --- the two voice switches; rules always go on BOTH ---
+      UFWMCP_TARGETS: "${UFWMCP_TARGETS}"
+      # Separate group, different ports: 80/443 tcp + 69 udp, not 5060.
+      UFWMCP_ENDPOINT_TARGETS: "${UFWMCP_ENDPOINT_TARGETS:-}"
+      # --- relay: the container cannot route to the switches directly ---
+      UFWMCP_RELAY_HOST: "${UFWMCP_RELAY_HOST}"
+      UFWMCP_RELAY_PORT: "${UFWMCP_RELAY_PORT:-22}"
+      UFWMCP_RELAY_USER: "${UFWMCP_RELAY_USER}"
+      UFWMCP_RELAY_PASSWORD_B64: "${UFWMCP_RELAY_PASSWORD_B64}"
+      UFWMCP_RELAY_KEY_FILE: "${UFWMCP_RELAY_KEY_FILE:-}"
+      # --- nocufw key, base64; written to 0600 inside the container only ---
+      UFWMCP_SSH_USER: "${UFWMCP_SSH_USER:-nocufw}"
+      UFWMCP_SSH_KEY_B64: "${UFWMCP_SSH_KEY_B64}"
+      UFWMCP_SSH_KEY_PATH: "${UFWMCP_SSH_KEY_PATH:-/keys/nocufw_ed25519}"
+      UFWMCP_SSH_TIMEOUT: "${UFWMCP_SSH_TIMEOUT:-20}"
+      # --- guardrails ---
+      UFWMCP_ALLOW_WRITES: "${UFWMCP_ALLOW_WRITES:-true}"
+      UFWMCP_MAX_IPS_PER_CALL: "${UFWMCP_MAX_IPS_PER_CALL:-25}"
+      UFWMCP_AUDIT_FILE: "${UFWMCP_AUDIT_FILE:-/audit/ufw-mcp.log}"
+      # --- dead-rule watch: scans both switches, mails John on NEW findings ---
+      # 0 disables it. Alerts go to approver@example.com and nowhere
+      # else; that recipient is fixed in code, not read from here.
+      UFWMCP_AUDIT_INTERVAL_HOURS: "${UFWMCP_AUDIT_INTERVAL_HOURS:-24}"
+      UFWMCP_RESEND_API_KEY: "${UFWMCP_RESEND_API_KEY:-}"
+    volumes:
+      # The audit trail MUST outlive the container. Push-to-deploy rebuilds it,
+      # and a log on the container filesystem dies with it.
+      - ufw-mcp-audit:/audit
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  ufw-mcp-audit:

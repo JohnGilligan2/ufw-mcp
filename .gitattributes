@@ -1,0 +1,10 @@
+# These are bash scripts that get installed onto Linux switches. If git hands
+# them back with CRLF endings, the shebang becomes "/bin/bash\r" and the box
+# answers with `bad interpreter: /bin/bash^M`. Pin them to LF regardless of
+# what core.autocrlf is set to on the machine doing the clone.
+docs/ufw-mcp-list             text eol=lf
+docs/ufw-mcp-allow            text eol=lf
+docs/ufw-mcp-allow-endpoint   text eol=lf
+docs/ufw-session-audit        text eol=lf
+docs/sip-unregistered-callers text eol=lf
+*.sh                          text eol=lf

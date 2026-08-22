@@ -1,0 +1,8 @@
+# Pinned exactly, not ranged: Portainer rebuilds the image from scratch on every
+# push, so a range lets PyPI decide how sessions behave. o365logs-mcp drifted
+# this way and started re-prompting for auth on every tool call.
+fastmcp==3.4.5
+mcp<2
+pydantic>=2.7
+python-dotenv>=1.0
+paramiko>=3.4

@@ -1,0 +1,133 @@
+#!/bin/bash
+# /usr/local/sbin/ufw-mcp-allow  --  root:root 0755, NOT writable by nocufw
+#
+# Adds the house SIP allow pair for ONE address, exactly as documented in the runbook:
+#     sudo ufw allow from <ip> to any port 5060 proto tcp
+#     sudo ufw allow from <ip> to any port 5060 proto udp
+#
+# One IP per invocation on purpose. The MCP tool loops for bulk adds, so the
+# privileged code stays small enough to read in one sitting.
+#
+# THE ONE THING THIS DOES THAT TYPING THE COMMAND DOES NOT: it refuses when a
+# DENY for the same address already sits ABOVE where the allow would land. UFW
+# is first-match-wins and `ufw allow` appends, so in that case the rule is
+# accepted, shows up in `ufw status`, and never passes a packet. That has
+# already happened twice in production (198.51.100.36 on both cores,
+# 198.51.100.42 on core2) and it is the failure this wrapper exists to stop.
+set -euo pipefail
+
+IP="${1:-}"; WHO="${2:-unknown}"; TICKET="${3:--}"; CUSTOMER="${4:--}"; OVERRIDE="${5:-no}"
+
+# ---- validate: one IPv4 host address, nothing else ------------------------
+[[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "refused: not a single IPv4 address"; exit 2; }
+IFS=. read -r a b c d <<< "$IP"
+for o in "$a" "$b" "$c" "$d"; do (( o >= 0 && o <= 255 )) || { echo "refused: bad octet"; exit 2; }; done
+case "$IP" in 0.0.0.0|255.255.255.255|127.*|169.254.*) echo "refused: reserved address"; exit 2;; esac
+[[ "$WHO" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || { echo "refused: bad identity string"; exit 2; }
+
+# The ticket reference is written into a `ufw ... comment "..."` argument, so it
+# is constrained here as well as in the caller. "-" means none was given.
+[[ "$TICKET" =~ ^[A-Za-z0-9#._-]{1,32}$ ]] || { echo "refused: bad ticket reference"; exit 2; }
+if [[ "$TICKET" == "-" ]]; then
+  STAMP_REF=""
+else
+  STAMP_REF=" ticket:$TICKET"
+fi
+
+# Customer name. Spaces are allowed here (real names have them) but quotes,
+# backticks, semicolons and $ are not: this ends up inside a quoted
+# `ufw ... comment "..."` argument.
+[[ "$CUSTOMER" =~ ^[A-Za-z0-9\ ._\&-]{1,48}$ ]] || { echo "refused: bad customer name"; exit 2; }
+if [[ "$CUSTOMER" != "-" ]]; then
+  STAMP_REF="$STAMP_REF cust:$CUSTOMER"
+fi
+
+# ---- do not race the APIBAN cron -----------------------------------------
+# apiban2ufw.sh runs every 4 minutes and issues many `ufw delete` calls. ufw
+# read-modify-writes /etc/ufw/user.rules and takes no cross-process lock, so a
+# rule added mid-run is erased when apiban writes back its older snapshot.
+# Wait for it to finish first.
+wait_for_apiban() {
+  local waited=0
+  while pgrep -f apiban2ufw >/dev/null 2>&1; do
+    if (( waited >= 120 )); then
+      echo "refused: APIBAN has been running for ${waited}s; not adding a rule"
+      echo "         it would probably be erased. Try again shortly."
+      exit 5
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+}
+wait_for_apiban
+
+STATUS="$(ufw status numbered)"
+
+# ---- idempotent -----------------------------------------------------------
+if grep -qE "5060/(tcp|udp)[[:space:]]+ALLOW IN[[:space:]]+${IP}([[:space:]]|$)" <<< "$STATUS"; then
+  echo "already allowed: $IP"; exit 0
+fi
+
+# ---- the ordering check ---------------------------------------------------
+DENY_LINE="$(grep -nE "DENY IN[[:space:]]+${IP}([[:space:]]|$)" <<< "$STATUS" | head -1 || true)"
+if [[ -n "$DENY_LINE" ]]; then
+  if [[ "$OVERRIDE" != "override-deny" ]]; then
+    echo "refused: a DENY for $IP already exists and would win, because ufw is"
+    echo "         first-match-wins and an appended allow lands below it:"
+    echo "           ${DENY_LINE#*:}"
+    echo "         Adding the allow here would look successful and do nothing."
+    echo "         Remove or supersede that DENY deliberately, then re-run."
+    exit 4
+  fi
+  # Explicit override: put the allow ABOVE the deny rather than appending.
+  #
+  # DURABILITY DEPENDS ON WHERE THE DENY CAME FROM. apiban2ufw.sh runs every 4
+  # minutes from /etc/cron.d/ns_apiban and adds feed entries with
+  # `ufw insert 1 deny ...` -- it inserts at the TOP, not the bottom. So an
+  # allow placed above an APIBAN deny is only above the denies that exist right
+  # now. If apiban.org re-lists this address, the new deny lands at position 1,
+  # above our allow, and the address is silently blocked again.
+  if grep -q "From APIBAN" <<< "$DENY_LINE"; then
+    echo "WARNING: that DENY came from the APIBAN feed, which re-inserts at"
+    echo "         position 1 every 4 minutes. This allow will work until"
+    echo "         apiban.org lists $IP again, then break with no signal."
+    echo "         The durable fix is upstream, at the feed, not here."
+    logger -t ufw-mcp "ALLOW $IP INSERTED ABOVE AN APIBAN DENY (non-durable) requested_by=$WHO"
+  else
+    logger -t ufw-mcp "ALLOW $IP INSERTED ABOVE A MANUAL DENY requested_by=$WHO"
+  fi
+  STAMP="mcp by:$WHO$STAMP_REF $(date -Is)"
+  ufw insert 1 allow from "$IP" to any port 5060 proto tcp comment "$STAMP"
+  ufw insert 1 allow from "$IP" to any port 5060 proto udp comment "$STAMP"
+  echo "added ABOVE an existing deny: $IP (5060 tcp+udp)"
+  exit 0
+fi
+
+# ---- normal path: exactly the documented commands -------------------------
+STAMP="mcp by:$WHO$STAMP_REF $(date -Is)"
+ufw allow from "$IP" to any port 5060 proto tcp comment "$STAMP"
+ufw allow from "$IP" to any port 5060 proto udp comment "$STAMP"
+# ---- verify the write actually stuck --------------------------------------
+# ufw printing "Rule added" is not proof: a concurrent apiban run can undo it
+# seconds later. Re-read the live rules and confirm.
+verify_present() {
+  ufw status | grep -qE "5060/(tcp|udp)[[:space:]]+ALLOW[[:space:]]+${IP}([[:space:]]|$)"
+}
+
+sleep 2
+if ! verify_present; then
+  echo "note: rules for $IP were not present after adding, retrying once"
+  wait_for_apiban
+  ufw allow from "$IP" to any port 5060 proto tcp comment "$STAMP" >/dev/null
+  ufw allow from "$IP" to any port 5060 proto udp comment "$STAMP" >/dev/null
+  sleep 2
+  if ! verify_present; then
+    echo "FAILED: added $IP but the rules are not in the live firewall."
+    echo "        Most likely the APIBAN cron overwrote them. Nothing to undo;"
+    echo "        re-run in a minute or two."
+    exit 6
+  fi
+fi
+
+logger -t ufw-mcp "ALLOW $IP 5060 tcp+udp requested_by=$WHO"
+echo "added: $IP (5060 tcp+udp)"

@@ -1,0 +1,68 @@
+#!/bin/bash
+# /usr/local/sbin/ufw-session-audit
+#
+# Answers: "is anything getting through that UFW is supposed to be blocking?"
+# on a box where conntrack(8) is not installed and CONFIG_NF_CONNTRACK_PROCFS
+# is off, so /proc/net/nf_conntrack does not exist.
+#
+# WHY THE OBVIOUS TEST DOES NOT WORK
+# tcpdump taps AF_PACKET at the device layer, which is BEFORE netfilter. A
+# denied IP showing up in tcpdump proves only that its packets reached the NIC.
+# They are very probably being dropped a microsecond later. Reading "denied IP
+# in tcpdump" as "firewall bypassed" produces false positives every time.
+#
+# WHAT ACTUALLY PROVES A BYPASS
+# Per-rule packet counters. If N packets arrive from an IP that has a DROP rule
+# and that rule's counter does not move, then something matched earlier in the
+# chain. On a UFW box that something is nearly always:
+#
+#   ufw-before-input rule 2:  ACCEPT all ctstate RELATED,ESTABLISHED
+#
+# which sits ahead of every deny in ufw-user-input. A flow already in the
+# conntrack table is accepted without the denies ever being consulted. That is
+# how a session established before the block survives the block.
+#
+# Usage:  ufw-session-audit [seconds]   (default 60)
+set -euo pipefail
+[[ $EUID -eq 0 ]] || { echo "must run as root"; exit 1; }
+WINDOW="${1:-60}"
+PORTS="${PORTS:-port 5060 or port 5061}"
+
+snapshot() {  # ip -> dropped packets
+  iptables -L ufw-user-input -n -v 2>/dev/null \
+    | awk '$3=="DROP" && $8 ~ /^[0-9.]+$/ && $8 != "0.0.0.0/0" {print $8" "$1}'
+}
+
+echo "== ufw-session-audit: ${WINDOW}s window on: ${PORTS}"
+echo "-- established-bypass rule currently in force --"
+iptables -L ufw-before-input -n -v --line-numbers | awk 'NR<=2 || /ESTABLISHED/'
+echo
+
+snapshot > /tmp/.ufwaudit.before
+timeout "$WINDOW" tcpdump -i any -nn -q -t -c 100000 "$PORTS" 2>/dev/null \
+  | grep -oE '^IP [0-9]{1,3}(\.[0-9]{1,3}){3}\.[0-9]+ >' \
+  | awk '{print $2}' | sed 's/\.[0-9]*$//' | sort | uniq -c | sort -rn \
+  > /tmp/.ufwaudit.seen || true
+snapshot > /tmp/.ufwaudit.after
+
+echo "-- verdicts for sources that HAVE a DROP rule --"
+found=0
+while read -r n ip; do
+  b=$(awk -v i="$ip" '$1==i{s+=$2} END{print s+0}' /tmp/.ufwaudit.before)
+  a=$(awk -v i="$ip" '$1==i{s+=$2} END{print s+0}' /tmp/.ufwaudit.after)
+  grep -q "^$ip " /tmp/.ufwaudit.before || continue
+  found=1
+  d=$((a - b))
+  if   (( d == 0 )); then echo "  BYPASSING  $ip  ${n} pkts arrived, DROP counter did not move"
+  elif (( d * 2 >= n )); then echo "  dropped    $ip  ${n} pkts, counter +${d}"
+  else echo "  PARTIAL    $ip  ${n} pkts, counter only +${d}"
+  fi
+done < /tmp/.ufwaudit.seen
+(( found )) || echo "  no source with a DROP rule sent anything in this window"
+
+echo
+echo "-- SIP reachable from ANY source? (no -s restriction) --"
+iptables -S ufw-user-input | grep -E 'dport 506[01]' | grep -- '-j ACCEPT' \
+  | grep -v -- '-s ' || echo "  none: every SIP accept is source-restricted"
+
+rm -f /tmp/.ufwaudit.before /tmp/.ufwaudit.after /tmp/.ufwaudit.seen

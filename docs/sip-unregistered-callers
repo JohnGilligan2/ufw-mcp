@@ -1,0 +1,55 @@
+#!/bin/bash
+# /usr/local/sbin/sip-unregistered-callers
+#
+# Finds IPs placing AUTHENTICATED calls as one of your subscribers while not
+# being an IP that subscriber registers from. That is the INVITE-without-
+# REGISTER pattern: stolen SIP credentials used to send calls directly, never
+# registering, so registrar_config never shows them and "who is registered"
+# will never find them.
+#
+# TWO GOTCHAS THAT WILL SILENTLY GIVE YOU AN EMPTY RESULT
+#
+#  1. time_start in CdrDomain.YYYYMM_r is a UNIX EPOCH INTEGER, while
+#     time_start in SiPbxDomain.activecalls and registrar_config is a DATETIME.
+#     Comparing the epoch column to `now() - interval 3 day` matches nothing and
+#     returns zero rows, which reads exactly like "no fraud". Always wrap with
+#     unix_timestamp(). This script does.
+#  2. sudo keeps your own $HOME unless you pass -H, so mysql never reads
+#     /root/.my.cnf and you get "Access denied". Run it with sudo -H.
+#
+# INTERPRETING THE OUTPUT - most hits are NOT fraud:
+#   * 166.x / mobile carrier IPs: softphones roam, the IP legitimately differs
+#   * calls ~= distinct destinations with 0 total seconds: a notification
+#     blast or auto-dialer, not necessarily an attacker
+#   * an IP in a country the customer has no presence in, WITH real talk time,
+#     is the shape actually worth chasing
+#
+# Usage:  sudo -H sip-unregistered-callers [days] [min_calls]
+set -euo pipefail
+DAYS="${1:-3}"; MIN="${2:-3}"
+TBL="CdrDomain.$(date +%Y%m)_r"
+
+mysql -t <<SQL
+select r.orig_domain, r.orig_sub, r.orig_ip,
+       count(*)                      as calls,
+       sum(r.duration)               as secs,
+       count(distinct r.orig_to_user) as dests,
+       from_unixtime(max(r.time_start)) as last_seen
+from ${TBL} r
+where r.time_start > unix_timestamp(now() - interval ${DAYS} day)
+  and r.orig_sub not in ('domain','')
+  and r.orig_domain <> '*'
+  and r.orig_ip <> ''
+  and r.orig_ip not like '172.20.%'
+  and r.orig_ip not like '10.%'
+  and r.orig_ip not like '192.168.%'
+  and r.orig_ip not in (
+        select substring_index(received_from,':',1)
+        from SiPbxDomain.registrar_config
+        where received_from <> '')
+group by r.orig_domain, r.orig_sub, r.orig_ip
+having calls >= ${MIN}
+   and secs > 0            -- real talk time; drop to 0 to include dialer noise
+order by secs desc
+limit 40;
+SQL

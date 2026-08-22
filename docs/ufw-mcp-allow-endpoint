@@ -1,0 +1,115 @@
+#!/bin/bash
+# /usr/local/sbin/ufw-mcp-allow-endpoint  --  root:root 0750, NOT writable by nocufw
+#
+# Adds the provisioning allow set for ONE address on the endpoints server:
+#     ufw allow from <ip> to any port 80  proto tcp
+#     ufw allow from <ip> to any port 443 proto tcp
+#     ufw allow from <ip> to any port 69  proto udp
+#
+# Three rules, because a phone fetches its config over HTTP/HTTPS and TFTP.
+#
+# THIS SCRIPT EXISTS ONLY ON THE ENDPOINTS SERVER, and ufw-mcp-allow (the SIP
+# one) exists only on the voice switches. The separation is deliberate: neither
+# box carries the other's port set, so a wrong target cannot open provisioning
+# ports on a switch or SIP on the web tier. That is a stronger guarantee than
+# passing a profile argument to one shared script, where a mistake in the caller
+# would be enough.
+#
+# Like its sibling it refuses when a DENY for the address already sits above
+# where the allow would land - ufw is first-match-wins and `ufw allow` appends,
+# so in that case the rule is accepted, shows in `ufw status`, and passes
+# nothing.
+set -euo pipefail
+
+IP="${1:-}"; WHO="${2:-unknown}"; TICKET="${3:--}"; CUSTOMER="${4:--}"; OVERRIDE="${5:-no}"
+
+# ---- validate: one IPv4 host address, nothing else ------------------------
+[[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "refused: not a single IPv4 address"; exit 2; }
+IFS=. read -r a b c d <<< "$IP"
+for o in "$a" "$b" "$c" "$d"; do (( o >= 0 && o <= 255 )) || { echo "refused: bad octet"; exit 2; }; done
+case "$IP" in 0.0.0.0|255.255.255.255|127.*|169.254.*) echo "refused: reserved address"; exit 2;; esac
+[[ "$WHO" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || { echo "refused: bad identity string"; exit 2; }
+
+# Ticket and customer are written into a `ufw ... comment "..."` argument, so
+# they are constrained here as well as in the caller. "-" means none given.
+[[ "$TICKET" =~ ^[A-Za-z0-9#._-]{1,32}$ ]] || { echo "refused: bad ticket reference"; exit 2; }
+if [[ "$TICKET" == "-" ]]; then STAMP_REF=""; else STAMP_REF=" ticket:$TICKET"; fi
+
+[[ "$CUSTOMER" =~ ^[A-Za-z0-9\ ._\&-]{1,48}$ ]] || { echo "refused: bad customer name"; exit 2; }
+if [[ "$CUSTOMER" != "-" ]]; then STAMP_REF="$STAMP_REF cust:$CUSTOMER"; fi
+
+# ---- do not race the APIBAN cron -----------------------------------------
+# apiban2ufw.sh runs every 4 minutes and issues many `ufw delete` calls. ufw
+# read-modify-writes /etc/ufw/user.rules and takes no cross-process lock, so a
+# rule added mid-run is erased when apiban writes back its older snapshot.
+# Wait for it to finish first.
+wait_for_apiban() {
+  local waited=0
+  while pgrep -f apiban2ufw >/dev/null 2>&1; do
+    if (( waited >= 120 )); then
+      echo "refused: APIBAN has been running for ${waited}s; not adding a rule"
+      echo "         it would probably be erased. Try again shortly."
+      exit 5
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+}
+wait_for_apiban
+
+STATUS="$(ufw status numbered)"
+
+# ---- idempotent -----------------------------------------------------------
+if grep -qE "(80|443)/tcp[[:space:]]+ALLOW IN[[:space:]]+${IP}([[:space:]]|$)" <<< "$STATUS"; then
+  echo "already allowed: $IP"; exit 0
+fi
+
+# ---- the ordering check ---------------------------------------------------
+DENY_LINE="$(grep -nE "DENY IN[[:space:]]+${IP}([[:space:]]|$)" <<< "$STATUS" | head -1 || true)"
+if [[ -n "$DENY_LINE" && "$OVERRIDE" != "override-deny" ]]; then
+  echo "refused: a DENY for $IP already exists and would win, because ufw is"
+  echo "         first-match-wins and an appended allow lands below it:"
+  echo "           ${DENY_LINE#*:}"
+  echo "         Adding the allow here would look successful and do nothing."
+  exit 4
+fi
+
+STAMP="mcp by:$WHO$STAMP_REF $(date -Is)"
+
+if [[ -n "$DENY_LINE" ]]; then
+  ufw insert 1 allow from "$IP" to any port 80 proto tcp comment "$STAMP"
+  ufw insert 1 allow from "$IP" to any port 443 proto tcp comment "$STAMP"
+  ufw insert 1 allow from "$IP" to any port 69 proto udp comment "$STAMP"
+  logger -t ufw-mcp "ALLOW-ENDPOINT $IP 80/443 tcp + 69 udp INSERTED ABOVE A DENY requested_by=$WHO"
+  echo "added ABOVE an existing deny: $IP (80,443/tcp + 69/udp)"
+  exit 0
+fi
+
+ufw allow from "$IP" to any port 80 proto tcp comment "$STAMP"
+ufw allow from "$IP" to any port 443 proto tcp comment "$STAMP"
+ufw allow from "$IP" to any port 69 proto udp comment "$STAMP"
+# ---- verify the write actually stuck --------------------------------------
+# ufw printing "Rule added" is not proof: a concurrent apiban run can undo it
+# seconds later. Re-read the live rules and confirm.
+verify_present() {
+  ufw status | grep -qE "(80|443)/tcp[[:space:]]+ALLOW[[:space:]]+${IP}([[:space:]]|$)"
+}
+
+sleep 2
+if ! verify_present; then
+  echo "note: rules for $IP were not present after adding, retrying once"
+  wait_for_apiban
+  ufw allow from "$IP" to any port 80 proto tcp comment "$STAMP" >/dev/null
+  ufw allow from "$IP" to any port 443 proto tcp comment "$STAMP" >/dev/null
+  ufw allow from "$IP" to any port 69 proto udp comment "$STAMP" >/dev/null
+  sleep 2
+  if ! verify_present; then
+    echo "FAILED: added $IP but the rules are not in the live firewall."
+    echo "        Most likely the APIBAN cron overwrote them. Nothing to undo;"
+    echo "        re-run in a minute or two."
+    exit 6
+  fi
+fi
+
+logger -t ufw-mcp "ALLOW-ENDPOINT $IP 80/443 tcp + 69 udp requested_by=$WHO"
+echo "added: $IP (80,443/tcp + 69/udp)"

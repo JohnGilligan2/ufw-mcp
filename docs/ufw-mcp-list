@@ -1,0 +1,66 @@
+#!/bin/bash
+# /usr/local/sbin/ufw-mcp-list  --  root:root, read-only. Never changes a rule.
+#
+#   tagged     what this tool added (rules carrying an "mcp by:" comment)
+#   counts     the house verification numbers
+#   conflicts  allows that sit below a deny for the same IP and never fire
+#   search IP  EVERY rule mentioning that exact address, anywhere in the chain
+#   cidrs      every rule whose source is a network, so the caller can work out
+#              containment (an address with no rule of its own can still be
+#              covered by something like 203.0.113.0/24)
+#   all        the complete numbered rule set. ~3,700 lines per voice switch,
+#              so the caller is expected to filter and to say plainly how much
+#              it is showing.
+#
+# WHY search AND cidrs EXIST
+# The first version of ufw_check_ip only looked at `tagged` and `conflicts`,
+# which meant any of the ~1,500 pre-existing allows, and any APIBAN deny with
+# no matching allow, came back as "no rule for this address". That is worse
+# than unhelpful: it told people it was safe to add when a deny was sitting
+# there, and invited duplicates of rules that already existed.
+set -euo pipefail
+
+case "${1:-tagged}" in
+  tagged)
+    ufw status numbered | grep "mcp by:" || echo "(no mcp-added rules)" ;;
+
+  counts)
+    echo "5060 tcp allows: $(ufw status | grep 5060 | grep -c tcp)"
+    echo "5060 udp allows: $(ufw status | grep 5060 | grep -c udp)"
+    echo "total rules    : $(ufw status numbered | grep -c '^\[')" ;;
+
+  conflicts)
+    ufw status numbered | awk '
+      match($0, /^\[[ ]*([0-9]+)\]/, m) {
+        n=m[1]; ip=""
+        if (match($0, /([0-9]{1,3}\.){3}[0-9]{1,3}/)) ip=substr($0,RSTART,RLENGTH)
+        if (ip=="") next
+        if ($0 ~ /DENY IN/)  { if (!(ip in d)) d[ip]=n }
+        if ($0 ~ /ALLOW IN/) { if (ip in d && d[ip] < n) print "DEAD: " ip " deny[" d[ip] "] < allow[" n "]  " $0 }
+      }' || true ;;
+
+  search)
+    IP="${2:-}"
+    # This mode is the only one taking caller input, so it is pinned hard: one
+    # IPv4 host address and nothing else. The value is interpolated into a
+    # regex below, so anything looser is a command-injection surface.
+    [[ "$IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "refused: not a single IPv4 address"; exit 2; }
+    IFS=. read -r a b c d <<< "$IP"
+    for o in "$a" "$b" "$c" "$d"; do
+      (( o >= 0 && o <= 255 )) || { echo "refused: bad octet"; exit 2; }
+    done
+    # Boundaries on both sides so 198.51.100.7 does not match inside
+    # 198.51.100.42, and 10.1.1.1 does not match inside 10.1.1.10.
+    ESC="${IP//./\.}"
+    ufw status numbered | grep -E "(^|[^0-9.])${ESC}([^0-9.]|$)" \
+      || echo "(no rule anywhere in ufw for ${IP})" ;;
+
+  cidrs)
+    ufw status numbered | grep -E "([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}" || echo "(no network-scoped rules)" ;;
+
+  all)
+    ufw status numbered ;;
+
+  *)
+    echo "usage: ufw-mcp-list [tagged|counts|conflicts|search <ip>|cidrs|all]"; exit 2 ;;
+esac
